@@ -2,85 +2,100 @@ import util.{CommandLineOptions, FileUtil, TextUtil}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.SparkContext
 
-/**
- * This second implementation of Word Count that makes the following changes:
- * <ol>
- * <li>A simpler approach is used for the algorithm.</li>
- * <li>A CommandLineOptions library is used.</li>
- * <li>The handling of the per-line data format is refined.</li>
- * <li>We show how to use Kryo serialization for better efficiency.</li>
- * </ol>
- */
-object task1 {
-  def main(args: Array[String]): Unit = {
-    // I extracted command-line processing code into a separate utility class,
-    // an illustration of how it's convenient that we can mix "normal" code
-    // with "big data" processing code.
-    val options = CommandLineOptions(
-      this.getClass.getSimpleName,
-      CommandLineOptions.inputPath("data/kjvdat.txt"),
-      CommandLineOptions.outputPath("output/kjv-wc3"),
-      CommandLineOptions.master("local"),
-      CommandLineOptions.quiet)
+import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.functions.{min,max}
+object task1
+{
+	def dfPeek(df: Dataset[_], numRows: Int) : Unit =
+	{
+		val lines =  df.count()
+		println(s"~~~ entries: $lines ~~~")	
+		df.show(numRows,false)
+   }
+	
+	def main(args: Array[String]): Unit =
+	{
+    	//command-line processing code
+		val options = CommandLineOptions(
+			this.getClass.getSimpleName,
+			CommandLineOptions.inputPath("data/oldDataTest/*.csv"),
+			CommandLineOptions.outputPath("output/task1"),
+			CommandLineOptions.master("local"),
+			CommandLineOptions.quiet)
 
-    val argz   = options(args.toList)
-    val master = argz("master")
-    val quiet  = argz("quiet").toBoolean
-    val in     = argz("input-path")
-    val out    = argz("output-path")
-    if (master.startsWith("local")) {
-      if (!quiet) println(s" **** Deleting old output (if any), $out:")
-      FileUtil.rmrf(out)
-    }
+		val argz   = options(args.toList)
+		val master = argz("master")
+		val quiet  = argz("quiet").toBoolean
+		val in     = argz("input-path")
+		val out    = argz("output-path")
+		if (master.startsWith("local"))
+		{
+			if (!quiet) println(s" **** Deleting old output (if any), $out:")
+			FileUtil.rmrf(out)
+		}
 
-    // Let's use Kryo serialization. Here's how to set it up.
-    // If the data had a custom type, we would want to register it. Kryo already
-    // handles common types, like String, which is all we use here:
-    // config.registerKryoClasses(Array(classOf[MyCustomClass]))
+		// Kryo serialization setup.
+		// If the data had a custom type, we would want to register it. Kryo already
+		// handles common types, like String, which is all we use here:
+		// config.registerKryoClasses(Array(classOf[MyCustomClass]))
 
-    val name = "Word Count (3)"
-    val spark = SparkSession.builder.
-      master(master).
-      appName(name).
-      config("spark.app.id", name).   // To silence Metrics warning.
-      config("spark.serializer", "org.apache.spark.serializer.KryoSerializer").
-      getOrCreate()
-    val sc = spark.sparkContext
+		val name = "Task1"
+		val spark = SparkSession.builder.
+			master(master).
+			appName(name).
+			config("spark.app.id", name).   // To silence Metrics warning.
+			config("spark.serializer", "org.apache.spark.serializer.KryoSerializer").
+			getOrCreate()
+			//val sc = spark.sparkContext
 
-    try {
-      // Load the input text, convert each line to lower case, then split
-      // into fields:
-      //   book|chapter|verse|text
-      // Keep only the text. The output is an RDD.
-      // Note that calling "last" on the split array is robust against lines
-      // that don't have the delimiter, if any.
-      // (Don't cache this time, as we're making a single pass through the data.)
-      val input = sc.textFile(in)
-        .map(line => TextUtil.toText(line)) // also converts to lower case
+		try
+		{
+			val df = spark.read
+				.format("csv")
+				.option("header", "true")
+				.option("mode", "DROPMALFORMED")
+				.load(in)
+			//df.cache //can cache a dataframe if we use it many times
 
-      // Split on non-alphabetic sequences of character as before.
-      // Rather than map to "(word, 1)" tuples, we treat the words by values
-      // and count the unique occurrences.
-      val wc1 = input
-        .flatMap(line => line.split("""[^\p{IsAlphabetic}]+"""))
-        .countByValue() // Returns a Map[T, Long] to the driver; no more RDD!
+			//FIND THE INFECTED TRAJECTORY START AND END TIMES
 
-      // ... and convert back to an RDD for output, with one "slice".
-      // First, convert to a comma-separated string. When you call "map" on
-      // a Map, you get 2-tuples for the key-value pairs. You extract the
-      // first and second elements with the "_1" and "_2" methods, respectively.
-      val wc2 = wc1.map(key_value => s"${key_value._1},${key_value._2}").toSeq
-      val wc = sc.makeRDD(wc2, 1)
+			val infect_id = 29//file traj24_19.csv
+			val df_infect = df.filter(df("OBJECTID")===infect_id)
+			val start = df_infect.agg(min("TIMESTAMP")).head.getString(0)//we know a single traj can always fit into memory so it's ok to do this
+			val end = df_infect.agg(max("TIMESTAMP")).head.getString(0)
+			
+			//FILTER COORDINATES RECORDED BEFORE OR AFTER
+			
+			val df_timeRelevant = df.filter(df("TIMESTAMP") >= start && df("TIMESTAMP") <= end)
+			//val df_timeRelevant = df.filter(df("TIMESTAMP") < start || df("TIMESTAMP") > end)
+			
+			println(s"start: $start\nend: $end")
+			dfPeek(df_timeRelevant,10)
 
-      if (!quiet) println(s"Writing output to: $out")
-      wc.saveAsTextFile(out)
+/*
 
-    } finally {
-      spark.stop()  // was sc.stop() in WordCount2
-    }
+DO THIS NOW FOR NAIVE IMPLEMENTATION:
 
-    // Exercise: Try different arguments for the input and output.
-    //   NOTE: I've observed 0 output for some small input files!
-    // Exercise: Sort by word length.
-  }
+for each cand pair:
+	count = 0
+	run along traj to find find the first points in the 2 trajs that are in range
+	keep moving along traj increasing count as long as next point pair is in range
+	if next pair is out of range: dont stop, remember count, could find more later
+	at end of traj, if count > exT -> out ID
+		
+AFTER CAN IMPROVE WITH LSH OR CLUSTER OR SMT
+	//SPLIT DATA IN BUCKETS BASED ON TIME (size = duration of infected/n, where n is COVID window?) TO OBTAIN SUBTRAJECTORIES
+	//OR CLUSTER BASED ON TIME? how to represent time as points in 2d plane?
+	//clustering based on point repr wont work since we can have different clusters but common subtraj
+	//COMPARE THE SUBTRAJECTORIES
+
+*/			
+
+
+		}
+		finally
+		{
+			spark.stop()
+		}
+	}
 }
