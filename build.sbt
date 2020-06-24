@@ -48,7 +48,7 @@ cleanupCommands += """
   spark.stop()
   """
 
-//addCommandAlias("ex2",  "runMain WordCount2")
+addCommandAlias("t1",  "runMain task1")
 //addCommandAlias("ex3",  "runMain WordCount3")
 //addCommandAlias("ex4",  "runMain Matrix4")
 //addCommandAlias("ex5a", "runMain Crawl5a")
