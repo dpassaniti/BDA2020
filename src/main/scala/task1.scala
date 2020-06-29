@@ -261,7 +261,7 @@ object task1
 			df_final.write
 				.format("com.databricks.spark.csv")
 				.option("header","true")
-				.save("./output/exposed")//finCandidates.foreach{println}			
+				.save("./output/task1")
 		}
 		finally
 		{
