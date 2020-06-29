@@ -49,13 +49,6 @@ cleanupCommands += """
   """
 
 addCommandAlias("t1",  "runMain task1")
-//addCommandAlias("ex3",  "runMain WordCount3")
-//addCommandAlias("ex4",  "runMain Matrix4")
-//addCommandAlias("ex5a", "runMain Crawl5a")
-//addCommandAlias("ex5b", "runMain InvertedIndex5b")
-//addCommandAlias("ex6",  "runMain NGrams6")
-//addCommandAlias("ex7",  "runMain Joins7")
-//addCommandAlias("ex8",  "runMain SparkSQL8")
 
 // Note the differences in the next two definitions:
 //addCommandAlias("ex10directory",  "runMain SparkStreaming10Main")

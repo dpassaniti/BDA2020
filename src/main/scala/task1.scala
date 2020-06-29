@@ -1,70 +1,13 @@
-/*
-NAIVE: JUST COMPARE ALL TRAJS AFTER FIRST TIME FILTER
-look at cosine sim? but we might need to have subtrajs first to compare...
-AFTER CAN IMPROVE WITH LSH OR CLUSTER OR SMT
-	//SPLIT DATA IN BUCKETS BASED ON TIME (size = duration of infected/n, where n is COVID window?) TO OBTAIN SUBTRAJECTORIES
-	//OR CLUSTER BASED ON TIME? how to represent time as points in 2d plane?
-	//clustering based on point repr wont work since we can have different clusters but common subtraj
-	//COMPARE THE SUBTRAJECTORIES
-
-CLUSTER:
-do clustering, not by reducing each traj to a point. treat each coord as point because we dont care about full
-	trajectory!!! we get clusters of points that are nearby each other. then we can create subtrajectories by taking all
-	the points within a cluster that belong to the same trajectory. then the candidate pairs are the subtrajectories
-	inside the same cluster!!!
-need a special (kmeans) version that takes into account COVID range?
-
-SUBTRAJ MAKING:
-FOR STARTERS, ALL POINTS WITHIN SAME CLUSTER ARE 1 SUBTRAJ
-in a traj, for each 3 consecutive points:
-	make vectors 1->2 and 2->3
-	if cosine sim is too high: end the current subtraj and start next one
-	each subtraj is represented by first and last point since they are mostly linear(line segment breakdown like traclus)
-	now we can compare subtraj from different TRAJIDS
-
-COMPARISON:
-for each cand pair:
-	count = 0
-	run along traj to find find the first points in the 2 trajs that are in range
-		foreach pointA:
-			foreach pointB:
-				if(dist() < treshold)
-					break
-	keep moving along traj increasing count as long as next point pair is in range
-	if next pair is out of range: dont stop, remember count, could find more later
-	at end of traj, if count > exT -> out ID
-
-or if we have clusters of segments:
-calc time exposures per segment pair
-from all clusters, sum all duratoins with same TrajInfectID-TrajID2 key
-per key: if > T -> out id
-clusters
-*/
-
-//SNIPPETS FOR REFERENCE
-
-////create a vector from x column of infected dframe (TEST for reference, we will use VectorAssembler)
-////in file row 1 = column names, row 2 = first values row, therefore in vector here, vecname(0) = row 2 in file
-//val rowsRdd = df_infect.select("X").rdd
-//val xs = Vectors.dense(rowsRdd.collect().map(x => x.getString(0).toDouble))
-
-////udf example
-// Define your udf. In this case I defined a simple function, but they can get complicated.
-//val myTransformationUDF = udf(value => value / 10)
-//// Run that transformation "over" your DataFrame
-//val afterTransformationDF = distinctValuesDF.select(myTransformationUDF(col("age")))
-
-//// vector from dataset and foreach
-//val relevantClusters = Vectors.dense(relevantClustersDf.rdd.collect().map(v => v.getInt(0).toDouble))
-//relevantClusters.foreachActive{(indx,id) => println(id)}
-
 import util.{CommandLineOptions, FileUtil, TextUtil}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.SparkContext
 
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.Row
+import java.sql.Timestamp
 import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.functions.{min,max}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
 
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.linalg.{Vectors, Vector}
@@ -73,15 +16,63 @@ import org.apache.spark.ml.clustering.BisectingKMeans
 import org.apache.spark.ml.clustering.{KMeans,KMeansModel}
 import org.apache.spark.sql.functions.udf
 
+import scala.math.pow
+
 object task1
 {
+	//class used to iterate over segment dataframe
+	case class segRow(pred_cluster:Int, OBJECTID:Int,
+							startT:Timestamp, startX:Double, startY:Double,
+							endT:Timestamp, endX:Double, endY:Double)
+
+	//show entries from dataframe
 	def dfPeek(df: Dataset[_], numRows: Int) : Unit =
 	{
 		val lines =  df.count()
 		println(s"~~~ entries: $lines ~~~")	
 		df.show(numRows,false)
    }
+
+	//determine similarity of two segments
+	def segmentSimilarity(inf: Row, other: segRow): Boolean = 
+	{
+		var similar = false
+
+		//check that the two segments exist at the same time
+		val infStart = inf(2).asInstanceOf[Timestamp]
+		val infEnd = inf(5).asInstanceOf[Timestamp]
+		
+		//if other starts before infected
+		if((other.startT.compareTo(infStart)) >= 0)
+		{
+			//if infected ends after other's start
+			similar = infEnd.compareTo(other.startT) >= 0 
+		}
+		else
+		{
+			//if other ends after infected's start
+			similar = other.endT.compareTo(infStart) >= 0
+		}
+		
+		//check distance
+		val infSX = inf(3).asInstanceOf[Double]
+		val infSY = inf(4).asInstanceOf[Double]
+		val infEX = inf(6).asInstanceOf[Double]
+		val infEY = inf(7).asInstanceOf[Double]
+		if(similar)
+		{
+			val sqrdStart = pow(infSX - other.startX,2) + pow(infSY - other.startY,2)
+			val sqrdEnd = pow(infEX - other.endX,2) + pow(infEY - other.endY,2)
+			val avgSqrdDist = (sqrdStart + sqrdEnd)/2
+			similar = avgSqrdDist <= 4//2 meters squared = 4
+		}
+		
+		return similar
+	}
 	
+	//funcion to add exposure time to final candidates dataframe
+	val idf_add = udf((prev: Int, post: Int) => prev + post)
+
 	def main(args: Array[String]): Unit =
 	{
     	//command-line processing code
@@ -116,7 +107,7 @@ object task1
 			config("spark.serializer", "org.apache.spark.serializer.KryoSerializer").
 			getOrCreate()
 			//val sc = spark.sparkContext
-
+		import spark.implicits._
 		try
 		{
 			//LOAD DATA
@@ -140,14 +131,15 @@ object task1
 			  .option("timestampFormat", "yy/MM/dd HH:mm:ss")
 			  .schema(schema)
 			  .load(in)
-			  .cache()
+			  .drop("FLOORID","ROOMID")
 
 			//FIND THE INFECTED TRAJECTORY START AND END TIMES
 			
 			val infect_id = 29//file traj24_19.csv
 			val df_infect = df.filter(df("OBJECTID")===infect_id)
-
-			val start = df_infect.agg(min("TIMESTAMP")).head.getTimestamp(0)//we know a single traj can always fit into memory so it's ok to do this
+			
+			//we know a single traj can always fit into memory so it's ok to do this
+			val start = df_infect.agg(min("TIMESTAMP")).head.getTimestamp(0)
 			val end = df_infect.agg(max("TIMESTAMP")).head.getTimestamp(0)
 			
 			//FILTER OUT COORDINATES RECORDED BEFORE OR AFTER
@@ -160,46 +152,116 @@ object task1
 			
 			val cols = Array("X","Y")
 			val assembler = new VectorAssembler().setInputCols(cols).setOutputCol("features")
-			val featureDf = assembler.transform(df_timeRelevant)
-			//println(featureDf.select("features").collect()(0))
+			val df_features = assembler.transform(df_timeRelevant).cache()
+			//println(df_features.select("features").collect()(0))
 	
-			//DON'T TRAIN ON WHOLE DATA?
+			//TODO DON'T TRAIN ON WHOLE DATA?
 			
 			//val seed = 5043
-			//val Array(trainingData, testData) = featureDf.randomSplit(Array(0.7, 0.3), seed)
+			//val Array(trainingData, testData) = df_features.randomSplit(Array(0.7, 0.3), seed)
 
 			//CREATE AND TRAIN MODEL
 
-			val nClusters = 100
+			val nClusters = 50
 			val bkmeans = new BisectingKMeans()
 				.setK(nClusters)
 				.setFeaturesCol("features")
-				.setPredictionCol("prediction")
-			val bkmeansModel = bkmeans.fit(featureDf)
+				.setPredictionCol("pred_cluster")
+			val bkmeansModel = bkmeans.fit(df_features)
 			
 			//CLUSTER DATA
 
 			//TODO save model and reuse it here so it's faster on future runs	
-			val clusteredDf = bkmeansModel.transform(featureDf)
+			val df_clustered = bkmeansModel.transform(df_features)
 			/*
-			dfPeek(clusteredDf.filter(clusteredDf("prediction")===0),20)
-			dfPeek(clusteredDf.filter(clusteredDf("prediction")===10),20)
-			dfPeek(clusteredDf.filter(clusteredDf("prediction")===70),3)
+			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===0),20)
+			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===10),20)
+			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===70),3)
 			*/
 
 			//FILTER OUT CLUSTERS NOT CONTAINING ANY INFECTED TRAJECTORY PARTS
 			
-			val relevantClustersDf = clusteredDf
-				.filter(clusteredDf("OBJECTID")===infect_id)
-				.select(clusteredDf("prediction"))
+			val df_relClusList = df_clustered
+				.filter(df_clustered("OBJECTID")===infect_id)
+				.select(df_clustered("pred_cluster"))
 				.distinct	
 			
-			val relevantClusters = relevantClustersDf.rdd.collect().map(v => v.getInt(0)).toList
+			val relevantClusters = df_relClusList.rdd.collect().map(v => v.getInt(0)).toList
 			//relevantClusters.foreach{println}
 			
-			val relClusDf = clusteredDf.filter(clusteredDf("prediction").isin(relevantClusters:_*))
-			dfPeek(relClusDf,5)
+			val df_relClus = df_clustered
+				.filter(df_clustered("pred_cluster").isin(relevantClusters:_*))
+				.drop("features")
+			//dfPeek(df_relClus,5)
 		
+			//we should use TIMESTAMP but our data has many entries with the same TIMESTAMP
+			//use row number instread (the "" field in csv) to find the earliest and latest coordinate
+			val df_segmentsStart = df_relClus
+				//.where($"OBJECTID"=!=infect_id)
+				.withColumn("minrow", min($"").over(Window.partitionBy($"pred_cluster",$"OBJECTID")))
+				.where($"" === $"minrow") 
+				.drop("minrow")
+				.orderBy("pred_cluster","OBJECTID")
+			//df_segmentsStart.show(20,true)
+			
+			val df_segmentsEnd = df_relClus
+				//.where($"OBJECTID"=!=infect_id)
+				.withColumn("maxrow", max($"").over(Window.partitionBy($"pred_cluster",$"OBJECTID")))
+				.where($"" === $"maxrow")
+				.drop("maxrow")
+				.orderBy("pred_cluster","OBJECTID")
+			//df_segmentsEnd.show(20,true)
+			
+			val df_segmentsAll = df_segmentsStart
+				.select($"pred_cluster",$"OBJECTID",$"TIMESTAMP".as("startT"),$"X".as("startX"),$"Y".as("startY"))
+				.join(
+					df_segmentsEnd
+						.select($"pred_cluster",$"OBJECTID",$"TIMESTAMP".as("endT"),$"X".as("endX"),$"Y".as("endY")),
+					Seq("pred_cluster","OBJECTID"),
+					"inner")
+
+			val df_infectSegs = df_segmentsAll.where($"OBJECTID" === infect_id).cache()
+			val df_segments = df_segmentsAll.where($"OBJECTID" =!= infect_id).cache()
+
+			//prepare map to record results
+			val df_allCandidates = df_segments.select($"OBJECTID").distinct()
+			val allCandidates = df_allCandidates.rdd.collect().map(v => v.getInt(0)).toList
+			val finCandidates = collection.mutable.Map(allCandidates.map(c => (c,0f)): _*)	
+
+			for(clus <- relevantClusters)
+			{
+				//print(s"|$clus|")//debug
+
+				val infRow = df_infectSegs.where($"pred_cluster" === clus).rdd.collect()//.foreach{println}
+				val df_currentC = df_segments.where($"pred_cluster"===clus).cache()
+				
+				//loop through all segments in the current cluster
+				//var count = 0//debug
+				df_currentC.as[segRow]
+					.collect()
+					.foreach(r =>
+					{
+						val toAdd = segmentSimilarity(infRow(0), r)
+						if(toAdd)
+						{
+							//count+=1//debug
+							val infStart = infRow(0)(2).asInstanceOf[Timestamp].getSeconds()
+							val infEnd = infRow(0)(5).asInstanceOf[Timestamp].getSeconds()
+							val exposure = (r.endT.getSeconds() - r.startT.getSeconds() + infEnd - infStart)/2f
+							finCandidates(r.OBJECTID) += exposure
+						}
+					})
+				//val tot = df_currentC.count.toInt//debug
+				//println(s"$count/$tot")//debug
+			}
+			
+			//filter and write results
+			finCandidates.retain((k,v) => v >= 15)//15 seconds or higher -> possible infection
+			val df_final = finCandidates.toSeq.toDF("OBJECTID", "exposureT")
+			df_final.write
+				.format("com.databricks.spark.csv")
+				.option("header","true")
+				.save("./output/exposed")//finCandidates.foreach{println}			
 		}
 		finally
 		{
@@ -207,3 +269,4 @@ object task1
 		}
 	}
 }
+
