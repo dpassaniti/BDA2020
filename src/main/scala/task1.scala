@@ -22,8 +22,8 @@ object task1
 {
 	//class used to iterate over segment dataframe
 	case class segRow(pred_cluster:Int, OBJECTID:Int,
-							startT:Timestamp, startX:Double, startY:Double,
-							endT:Timestamp, endX:Double, endY:Double)
+		startT:Timestamp, startX:Double, startY:Double,
+		endT:Timestamp, endX:Double, endY:Double)
 
 	//show entries from dataframe
 	def dfPeek(df: Dataset[_], numRows: Int) : Unit =
@@ -70,14 +70,12 @@ object task1
 		return similar
 	}
 	
-	//funcion to add exposure time to final candidates dataframe
-	val idf_add = udf((prev: Int, post: Int) => prev + post)
-
 	def main(args: Array[String]): Unit =
 	{
     	//command-line processing code
 		val options = CommandLineOptions(
 			this.getClass.getSimpleName,
+			//CommandLineOptions.inputPath("data/19/*.csv"),
 			CommandLineOptions.inputPath("data/oldDataTest/*.csv"),
 			CommandLineOptions.outputPath("output/task1"),
 			CommandLineOptions.master("local"),
@@ -108,6 +106,7 @@ object task1
 			getOrCreate()
 			//val sc = spark.sparkContext
 		import spark.implicits._
+
 		try
 		{
 			//LOAD DATA
@@ -133,59 +132,52 @@ object task1
 			  .load(in)
 			  .drop("FLOORID","ROOMID")
 
+			println("Loaded dataset ...")
+
 			//FIND THE INFECTED TRAJECTORY START AND END TIMES
-			
 			val infect_id = 29//file traj24_19.csv
 			val df_infect = df.filter(df("OBJECTID")===infect_id)
-			
+
 			//we know a single traj can always fit into memory so it's ok to do this
 			val start = df_infect.agg(min("TIMESTAMP")).head.getTimestamp(0)
-			val end = df_infect.agg(max("TIMESTAMP")).head.getTimestamp(0)
-			
+			val end = df_infect.agg(max("TIMESTAMP")).head.getTimestamp(0)	
+
 			//FILTER OUT COORDINATES RECORDED BEFORE OR AFTER
-			
 			val df_timeRelevant = df.filter(df("TIMESTAMP") >= start && df("TIMESTAMP") <= end)
 			//println(s"start: $start\nend: $end")
 			//dfPeek(df_timeRelevant,10)
 		
 			//TRAIN THE CLUSTERING MODEL ON X,Y
-			
 			val cols = Array("X","Y")
 			val assembler = new VectorAssembler().setInputCols(cols).setOutputCol("features")
 			val df_features = assembler.transform(df_timeRelevant).cache()
 			//println(df_features.select("features").collect()(0))
 	
 			//TODO DON'T TRAIN ON WHOLE DATA?
-			
 			//val seed = 5043
 			//val Array(trainingData, testData) = df_features.randomSplit(Array(0.7, 0.3), seed)
 
 			//CREATE AND TRAIN MODEL
-
+			println("Training bkm + clustering...")
 			val nClusters = 50
 			val bkmeans = new BisectingKMeans()
 				.setK(nClusters)
 				.setFeaturesCol("features")
 				.setPredictionCol("pred_cluster")
 			val bkmeansModel = bkmeans.fit(df_features)
-			
-			//CLUSTER DATA
 
+			//CLUSTER DATA
 			//TODO save model and reuse it here so it's faster on future runs	
 			val df_clustered = bkmeansModel.transform(df_features)
-			/*
-			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===0),20)
-			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===10),20)
-			dfPeek(df_clustered.filter(df_clustered("pred_cluster")===70),3)
-			*/
+			//dfPeek(df_clustered.filter(df_clustered("pred_cluster")===0),20)
+			//dfPeek(df_clustered.filter(df_clustered("pred_cluster")===10),20)
 
 			//FILTER OUT CLUSTERS NOT CONTAINING ANY INFECTED TRAJECTORY PARTS
-			
 			val df_relClusList = df_clustered
 				.filter(df_clustered("OBJECTID")===infect_id)
 				.select(df_clustered("pred_cluster"))
-				.distinct	
-			
+				.distinct
+		
 			val relevantClusters = df_relClusList.rdd.collect().map(v => v.getInt(0)).toList
 			//relevantClusters.foreach{println}
 			
@@ -193,7 +185,19 @@ object task1
 				.filter(df_clustered("pred_cluster").isin(relevantClusters:_*))
 				.drop("features")
 			//dfPeek(df_relClus,5)
-		
+
+			/*
+			//out for visalisation 1
+			println("(points) and full traj")
+			val temp1 = df_relClus.where($"pred_cluster" === 6)//points and full traj
+			temp1.coalesce(1)
+				.write
+				.format("com.databricks.spark.csv")
+				.option("header","true")
+				.save("./output/task1/vis1")
+			*/
+
+			println("Creating segments ...")
 			//we should use TIMESTAMP but our data has many entries with the same TIMESTAMP
 			//use row number instread (the "" field in csv) to find the earliest and latest coordinate
 			val df_segmentsStart = df_relClus
@@ -219,6 +223,17 @@ object task1
 						.select($"pred_cluster",$"OBJECTID",$"TIMESTAMP".as("endT"),$"X".as("endX"),$"Y".as("endY")),
 					Seq("pred_cluster","OBJECTID"),
 					"inner")
+			
+			/*
+			//out for vosualisation 2
+			println("segment repr")
+			val temp2 = df_segmentsAll.where($"pred_cluster" === 6)//segment repr
+			temp2.coalesce(1)
+				.write
+				.format("com.databricks.spark.csv")
+				.option("header","true")
+				.save("./output/task1/vis2")
+			*/
 
 			val df_infectSegs = df_segmentsAll.where($"OBJECTID" === infect_id).cache()
 			val df_segments = df_segmentsAll.where($"OBJECTID" =!= infect_id).cache()
@@ -228,6 +243,7 @@ object task1
 			val allCandidates = df_allCandidates.rdd.collect().map(v => v.getInt(0)).toList
 			val finCandidates = collection.mutable.Map(allCandidates.map(c => (c,0f)): _*)	
 
+			println("Similarity check ...")
 			for(clus <- relevantClusters)
 			{
 				//print(s"|$clus|")//debug
@@ -261,7 +277,7 @@ object task1
 			df_final.write
 				.format("com.databricks.spark.csv")
 				.option("header","true")
-				.save("./output/task1")
+				.save("./output/task1/final")
 		}
 		finally
 		{
